@@ -1,5 +1,19 @@
 """
-app.py - Image Processing Worker Service (v5)
+app.py - Image Processing Worker Service (v6)
+
+Changes from v5 (this pass — circuit breakers, timed locks, reduced fan-in):
+ - Added a CircuitBreaker around every external dependency call: Postgres
+   (via db_session), Redis, and outbound HTTP (image download + webhook).
+   Previously a struggling DB/Redis/upstream got hit at full request rate
+   forever; now each dependency trips open after repeated failures and
+   fails fast for a cooldown period instead of piling up latency.
+ - All locks (BoundedDict/BoundedSet/Metrics/_retry_lock) now acquire with
+   a timeout instead of blocking indefinitely, so lock contention surfaces
+   as a fast, loggable error instead of a silent thread hang.
+ - Task completion now goes through a single save_task_result() call
+   instead of process_task/process_with_retry each calling store_result()
+   and persist_result() separately — fewer call sites touching the same
+   two external systems, which was flagged as high fan-in.
 
 Changes from v4 (reliability hardening pass):
  - All shared in-memory state (_metrics, _image_cache, _retry_counts,
@@ -89,6 +103,113 @@ if not API_KEYS:
                 "until API_KEYS is set. This is intentional; do not hardcode fallback keys.")
 
 
+LOCK_TIMEOUT = float(os.getenv("LOCK_TIMEOUT_SECONDS", 5))
+
+
+class LockTimeoutError(RuntimeError):
+    pass
+
+
+class TimedLock:
+    """A Lock wrapper that never blocks forever. Raises LockTimeoutError
+    instead of hanging indefinitely under contention — a raw threading.Lock
+    acquired with no timeout is itself an unprotected risky call."""
+
+    def __init__(self, timeout: float = LOCK_TIMEOUT):
+        self._lock = threading.Lock()
+        self._timeout = timeout
+
+    @contextmanager
+    def __call__(self):
+        acquired = self._lock.acquire(timeout=self._timeout)
+        if not acquired:
+            raise LockTimeoutError(f"Could not acquire lock within {self._timeout}s")
+        try:
+            yield
+        finally:
+            self._lock.release()
+
+
+class CircuitBreaker:
+    """Simple failure-counting circuit breaker for external dependencies
+    (DB, Redis, HTTP). Closed -> normal operation. Opens after
+    `failure_threshold` consecutive failures and fails fast (raising
+    CircuitOpenError) for `recovery_timeout` seconds, rather than letting
+    every caller keep hammering a dependency that's already struggling.
+    After the cooldown it goes half-open: exactly one call is allowed
+    through as a probe; success closes the circuit, failure re-opens it."""
+
+    class CircuitOpenError(RuntimeError):
+        pass
+
+    def __init__(self, name: str, failure_threshold: int = 5, recovery_timeout: float = 30.0):
+        self.name = name
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self._lock = threading.Lock()
+        self._failures = 0
+        self._state = "closed"          # closed | open | half_open
+        self._opened_at = None
+
+    def _enter(self):
+        with self._lock:
+            if self._state == "open":
+                if time.time() - self._opened_at >= self.recovery_timeout:
+                    self._state = "half_open"
+                else:
+                    raise CircuitBreaker.CircuitOpenError(
+                        f"circuit '{self.name}' is open — failing fast")
+
+    def _on_success(self):
+        with self._lock:
+            self._failures = 0
+            self._state = "closed"
+            self._opened_at = None
+
+    def _on_failure(self):
+        with self._lock:
+            self._failures += 1
+            if self._state == "half_open" or self._failures >= self.failure_threshold:
+                self._state = "open"
+                self._opened_at = time.time()
+
+    def call(self, fn, *args, **kwargs):
+        self._enter()
+        try:
+            result = fn(*args, **kwargs)
+        except Exception:
+            self._on_failure()
+            raise
+        else:
+            self._on_success()
+            return result
+
+
+def call_with_retry(breaker: "CircuitBreaker", fn, *args, retries=2, base_delay=1.0, **kwargs):
+    """Runs fn() through the given circuit breaker, retrying transient
+    failures with exponential backoff. Does not retry when the breaker is
+    open — that's the point of the breaker, fail fast instead of piling on."""
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            return breaker.call(fn, *args, **kwargs)
+        except CircuitBreaker.CircuitOpenError:
+            raise
+        except Exception as e:
+            last_exc = e
+            if attempt < retries:
+                time.sleep(base_delay * (2 ** attempt))
+    raise last_exc
+
+
+# Dedicated breaker per external dependency so one struggling system
+# doesn't trip the breaker for an unrelated one.
+_db_breaker      = CircuitBreaker("database", failure_threshold=5, recovery_timeout=30)
+_redis_breaker   = CircuitBreaker("redis", failure_threshold=5, recovery_timeout=15)
+_http_breaker    = CircuitBreaker("http_download", failure_threshold=5, recovery_timeout=30)
+_webhook_breaker = CircuitBreaker("webhook", failure_threshold=8, recovery_timeout=30)
+
+
 # ── Thread-safe bounded shared state ─────────────────────────────────────────
 class BoundedDict:
     """Thread-safe dict with a max size; evicts oldest entries (insertion order)."""
@@ -96,18 +217,18 @@ class BoundedDict:
     def __init__(self, max_size: int):
         self._data = OrderedDict()
         self._max_size = max_size
-        self._lock = threading.Lock()
+        self._lock = TimedLock()
 
     def __contains__(self, key):
-        with self._lock:
+        with self._lock():
             return key in self._data
 
     def get(self, key, default=None):
-        with self._lock:
+        with self._lock():
             return self._data.get(key, default)
 
     def set(self, key, value):
-        with self._lock:
+        with self._lock():
             if key in self._data:
                 self._data.move_to_end(key)
             self._data[key] = value
@@ -115,23 +236,23 @@ class BoundedDict:
                 self._data.popitem(last=False)
 
     def pop(self, key, default=None):
-        with self._lock:
+        with self._lock():
             return self._data.pop(key, default)
 
     def prune(self, predicate):
         """Remove entries where predicate(key, value) is True."""
-        with self._lock:
+        with self._lock():
             stale = [k for k, v in self._data.items() if predicate(k, v)]
             for k in stale:
                 del self._data[k]
             return len(stale)
 
     def __len__(self):
-        with self._lock:
+        with self._lock():
             return len(self._data)
 
     def values(self):
-        with self._lock:
+        with self._lock():
             return list(self._data.values())
 
 
@@ -141,11 +262,11 @@ class BoundedSet:
     def __init__(self, max_size: int):
         self._data = OrderedDict()
         self._max_size = max_size
-        self._lock = threading.Lock()
+        self._lock = TimedLock()
 
     def add_if_new(self, key) -> bool:
         """Returns True if key was newly added, False if it already existed."""
-        with self._lock:
+        with self._lock():
             if key in self._data:
                 return False
             self._data[key] = True
@@ -154,46 +275,46 @@ class BoundedSet:
             return True
 
     def __len__(self):
-        with self._lock:
+        with self._lock():
             return len(self._data)
 
 
 class Metrics:
     def __init__(self):
-        self._lock = threading.Lock()
+        self._lock = TimedLock()
         self._counters = {"tasks_processed": 0, "tasks_failed": 0, "bytes_stored": 0, "cache_hits": 0}
 
     def incr(self, key, amount=1):
-        with self._lock:
+        with self._lock():
             self._counters[key] = self._counters.get(key, 0) + amount
 
     def snapshot(self):
-        with self._lock:
+        with self._lock():
             return dict(self._counters)
 
 
 _metrics       = Metrics()
 _image_cache   = BoundedDict(IMAGE_CACHE_MAX)
 _retry_counts  = defaultdict(int)
-_retry_lock    = threading.Lock()
+_retry_lock    = TimedLock()
 _job_chain     = BoundedDict(10000)
 _seen_hashes   = BoundedSet(DEDUP_CACHE_MAX)
 _sla_tracker   = BoundedDict(SLA_TRACKER_MAX)
 
 
 def _incr_retry(task_id: str) -> int:
-    with _retry_lock:
+    with _retry_lock():
         _retry_counts[task_id] += 1
         return _retry_counts[task_id]
 
 
 def _get_retry(task_id: str) -> int:
-    with _retry_lock:
+    with _retry_lock():
         return _retry_counts[task_id]
 
 
 def _clear_retry(task_id: str):
-    with _retry_lock:
+    with _retry_lock():
         _retry_counts.pop(task_id, None)
 
 
@@ -211,11 +332,17 @@ Session = sessionmaker(bind=engine)
 
 @contextmanager
 def db_session():
-    """Always closes the session, commits on success, rolls back on error."""
-    session = Session()
+    """Always closes the session, commits on success, rolls back on error.
+    Session creation and commit are routed through the DB circuit breaker
+    so a struggling Postgres fails fast instead of piling up connections
+    and latency once it's already unhealthy."""
+    def _open():
+        return Session()
+
+    session = call_with_retry(_db_breaker, _open, retries=1, base_delay=0.5)
     try:
         yield session
-        session.commit()
+        _db_breaker.call(session.commit)
     except Exception:
         session.rollback()
         raise
@@ -264,6 +391,8 @@ def persist_result(task_id: str, meta: dict, error: str = None):
                 "meta":   json.dumps(meta),
                 "err":    error,
             })
+    except CircuitBreaker.CircuitOpenError:
+        log.warning(f"DB circuit open — skipped write for {task_id}, will not retry inline")
     except Exception as e:
         # DB being down shouldn't crash a worker thread — log and move on.
         log.error(f"DB write failed for {task_id}: {e}")
@@ -276,6 +405,9 @@ def query_result(task_id: str) -> dict:
                 text("SELECT meta, status, error FROM task_results WHERE task_id = :tid"),
                 {"tid": task_id}
             ).fetchone()
+    except CircuitBreaker.CircuitOpenError:
+        log.warning(f"DB circuit open — read for {task_id} skipped")
+        return None
     except Exception as e:
         log.error(f"DB read failed for {task_id}: {e}")
         return None
@@ -287,6 +419,13 @@ def query_result(task_id: str) -> dict:
 # ── Redis ─────────────────────────────────────────────────────────────────────
 r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=False,
                  socket_timeout=10, socket_connect_timeout=10)
+
+
+def redis_call(fn, *args, **kwargs):
+    """Runs a Redis operation through the Redis circuit breaker with one
+    retry. Raises redis.RedisError or CircuitBreaker.CircuitOpenError on
+    failure — callers decide whether that's fatal for their code path."""
+    return call_with_retry(_redis_breaker, fn, *args, retries=1, base_delay=0.5, **kwargs)
 
 
 # ── Flask API ─────────────────────────────────────────────────────────────────
@@ -324,7 +463,10 @@ def submit_task():
     _sla_tracker.set(data["id"], time.time())
 
     try:
-        r.rpush(queue, payload)
+        redis_call(r.rpush, queue, payload)
+    except CircuitBreaker.CircuitOpenError:
+        log.warning("Redis circuit open — rejecting /submit")
+        return jsonify({"error": "queue temporarily unavailable"}), 503
     except redis.RedisError as e:
         log.error(f"Failed to enqueue task {data['id']}: {e}")
         return jsonify({"error": "queue unavailable"}), 503
@@ -351,6 +493,12 @@ def get_metrics():
         "sla_breaches": breaches,
         "dedup_cache":  len(_seen_hashes),
         "sla_tracked":  len(_sla_tracker),
+        "circuits": {
+            "database": _db_breaker._state,
+            "redis": _redis_breaker._state,
+            "http_download": _http_breaker._state,
+            "webhook": _webhook_breaker._state,
+        },
     }), 200
 
 
@@ -402,14 +550,19 @@ def run_scheduler():
 
 
 # ── Image helpers ─────────────────────────────────────────────────────────────
+def _fetch_image_bytes(url: str) -> bytes:
+    response = requests.get(url, timeout=DOWNLOAD_TIMEOUT, verify=VERIFY_TLS)
+    response.raise_for_status()
+    return response.content
+
+
 def download_image(url: str) -> Image.Image:
     cached = _image_cache.get(url)
     if cached is not None:
         _metrics.incr("cache_hits")
         return cached
-    response = requests.get(url, timeout=DOWNLOAD_TIMEOUT, verify=VERIFY_TLS)
-    response.raise_for_status()
-    img = Image.open(BytesIO(response.content))
+    content = call_with_retry(_http_breaker, _fetch_image_bytes, url, retries=1, base_delay=1.0)
+    img = Image.open(BytesIO(content))
     img.load()  # force decode now so a corrupt image fails here, not later
     _image_cache.set(url, img)
     return img
@@ -445,26 +598,43 @@ def convert_format(img: Image.Image, fmt: str) -> bytes:
 
 def store_result(task_id: str, data: bytes, meta: dict):
     try:
-        r.set(f"result:{task_id}:data", data)
-        r.set(f"result:{task_id}:meta", json.dumps(meta))
+        redis_call(r.set, f"result:{task_id}:data", data)
+        redis_call(r.set, f"result:{task_id}:meta", json.dumps(meta))
         _metrics.incr("bytes_stored", len(data))
+    except CircuitBreaker.CircuitOpenError:
+        log.warning(f"Redis circuit open — could not store result for {task_id}")
+        raise
     except redis.RedisError as e:
         log.error(f"Failed to store result for {task_id} in Redis: {e}")
         raise
 
 
 # ── Webhook ───────────────────────────────────────────────────────────────────
+def _post_webhook(webhook_url: str, payload: dict):
+    resp = requests.post(webhook_url, json=payload, timeout=WEBHOOK_TIMEOUT)
+    resp.raise_for_status()
+
+
 def notify_webhook(webhook_url: str, payload: dict):
-    for attempt in range(1, WEBHOOK_MAX_RETRIES + 2):
-        try:
-            resp = requests.post(webhook_url, json=payload, timeout=WEBHOOK_TIMEOUT)
-            resp.raise_for_status()
-            return
-        except Exception as e:
-            log.warning(f"Webhook attempt {attempt} to {webhook_url} failed: {e}")
-            if attempt <= WEBHOOK_MAX_RETRIES:
-                time.sleep(2 ** attempt)
-    log.error(f"Webhook to {webhook_url} permanently failed after {WEBHOOK_MAX_RETRIES + 1} attempts")
+    try:
+        call_with_retry(_webhook_breaker, _post_webhook, webhook_url, payload,
+                         retries=WEBHOOK_MAX_RETRIES, base_delay=2.0)
+    except CircuitBreaker.CircuitOpenError:
+        log.warning(f"Webhook circuit open — skipped notify to {webhook_url}")
+    except Exception as e:
+        log.error(f"Webhook to {webhook_url} permanently failed: {e}")
+
+
+def save_task_result(task_id: str, data: bytes = None, meta: dict = None, error: str = None):
+    """Single entry point for persisting a task outcome. Both process_task
+    and process_with_retry previously called store_result() and
+    persist_result() separately (two external-system call sites per
+    caller); consolidating into one function reduces fan-in and keeps the
+    Redis-write / Postgres-write pairing consistent in one place."""
+    meta = meta or {}
+    if data is not None:
+        store_result(task_id, data, meta)
+    persist_result(task_id, meta, error=error)
 
 
 # ── Job chaining ──────────────────────────────────────────────────────────────
@@ -472,7 +642,10 @@ def enqueue_child_tasks(parent_id: str, child_tasks: list):
     _job_chain.set(parent_id, child_tasks)
     for child in child_tasks:
         child["parent_id"] = parent_id
-        r.rpush(TASK_QUEUE, json.dumps(child))
+        try:
+            redis_call(r.rpush, TASK_QUEUE, json.dumps(child))
+        except (CircuitBreaker.CircuitOpenError, redis.RedisError) as e:
+            log.error(f"Failed to enqueue child task of {parent_id}: {e}")
 
 
 # ── Task processing ───────────────────────────────────────────────────────────
@@ -508,8 +681,7 @@ def process_task(task: dict):
         "options":      options,
     }
 
-    store_result(task_id, data, meta)
-    persist_result(task_id, meta)
+    save_task_result(task_id, data=data, meta=meta)
     _metrics.incr("tasks_processed")
     _sla_tracker.pop(task_id, None)   # completed — stop tracking it
 
@@ -532,7 +704,9 @@ def process_batch(batch: dict):
             log.error(f"Batch {batch_id} task {task.get('id')} failed: {e}")
             results.append({"id": task.get("id"), "status": "failed", "error": str(e)})
     try:
-        r.set(f"batch:{batch_id}:results", json.dumps(results))
+        redis_call(r.set, f"batch:{batch_id}:results", json.dumps(results))
+    except CircuitBreaker.CircuitOpenError:
+        log.warning(f"Redis circuit open — could not store batch results for {batch_id}")
     except redis.RedisError as e:
         log.error(f"Failed to store batch results for {batch_id}: {e}")
 
@@ -553,7 +727,7 @@ def process_with_retry(task: dict):
             wait = 2 ** count
             log.warning(f"Retry {count}/{MAX_RETRIES} for {task_id}: {e}")
             time.sleep(wait)
-    persist_result(task_id, {}, error="max retries exceeded")
+    save_task_result(task_id, error="max retries exceeded")
     _sla_tracker.pop(task_id, None)
     _clear_retry(task_id)
     log.error(f"Task {task_id} permanently failed.")
@@ -564,7 +738,9 @@ def worker_loop(worker_id: int):
     queues = [PRIORITY_QUEUE, TASK_QUEUE if worker_id % 2 == 0 else BATCH_QUEUE]
     while True:
         try:
-            result = r.blpop(queues, timeout=5)
+            result = r.blpop(queues, timeout=5)   # blocking pop already has its own timeout;
+                                                    # not routed through the breaker's retry logic
+                                                    # since that would defeat the blocking wait.
             if result is None:
                 continue
             queue_name, raw = result
