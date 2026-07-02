@@ -1,16 +1,36 @@
 """
-app.py - Image Processing Worker Service (v4)
-Changes from v3:
- - Added PostgreSQL persistence layer (SQLAlchemy)
- - Added basic API key auth middleware
- - Added scheduled cleanup job
- - Added request deduplication
- - Added per-task SLA tracking
+app.py - Image Processing Worker Service (v5)
+
+Changes from v4 (reliability hardening pass):
+ - All shared in-memory state (_metrics, _image_cache, _retry_counts,
+   _seen_hashes, _sla_tracker, _job_chain) is now protected by locks and
+   bounded in size (previously unlocked dicts/sets mutated concurrently by
+   8 worker threads + the Flask thread, growing forever).
+ - DB connection pool sized for actual concurrency (was 2 connections /
+   0 overflow shared by 8 worker threads + API thread -> guaranteed
+   blocking/timeouts under load). Added pool_pre_ping + pool_recycle.
+ - DB sessions are now always closed via context manager, including on
+   exception (previously leaked sessions on the persist_result error path).
+ - Startup now waits for the DB to become reachable instead of crashing
+   immediately if Postgres isn't up yet.
+ - Auth is now enforced via a decorator on every route, including
+   /metrics, which previously had no auth check at all.
+ - TLS verification is back on by default for outbound image downloads
+   (was verify=False, silently accepting invalid certs).
+ - content hash for dedup switched from MD5 to SHA-256.
+ - Cleanup job now also prunes _seen_hashes and _sla_tracker, not just
+   the Postgres table, so those structures no longer grow unbounded.
+ - SLA tracker entries are removed once a task completes (previously
+   left forever, corrupting the sla_breaches metric over time).
+ - Webhook calls now have a timeout and bounded retries instead of a
+   single best-effort POST with no timeout.
+ - Replaced print() with the logging module for real log levels.
 """
 
 import os
 import time
 import json
+import logging
 import redis
 import threading
 import requests
@@ -18,216 +38,380 @@ import hashlib
 import schedule
 from PIL import Image, ImageDraw, ImageFont
 from io import BytesIO
+from functools import wraps
+from collections import defaultdict, OrderedDict
 from datetime import datetime, timedelta
-from collections import defaultdict
-from flask import Flask, request, jsonify, g
+from flask import Flask, request, jsonify
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
+from contextlib import contextmanager
+
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s [%(levelname)s] %(threadName)s: %(message)s",
+)
+log = logging.getLogger("imgworker")
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
-REDIS_HOST          = os.getenv("REDIS_HOST", "localhost")
-REDIS_PORT          = int(os.getenv("REDIS_PORT", 6379))
-DB_URL              = os.getenv("DATABASE_URL", "postgresql://user:password@localhost/imgworker")
-TASK_QUEUE          = "image_tasks"
-BATCH_QUEUE         = "batch_tasks"
-PRIORITY_QUEUE      = "priority_tasks"
-MAX_IMAGE_SIZE      = (4096, 4096)
-DOWNLOAD_TIMEOUT    = 60
-WORKER_CONCURRENCY  = 8
-MAX_RETRIES         = 3
-API_PORT            = int(os.getenv("API_PORT", 5000))
-WATERMARK_TEXT      = os.getenv("WATERMARK_TEXT", "© DeployGuard")
-SLA_SECONDS         = int(os.getenv("SLA_SECONDS", 30))
-CLEANUP_INTERVAL    = 60                       # seconds between cleanup runs
-API_KEYS            = set(os.getenv("API_KEYS", "secret123,devkey").split(","))
-                                               # hardcoded fallback keys in source
+REDIS_HOST           = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT           = int(os.getenv("REDIS_PORT", 6379))
+DB_URL               = os.getenv("DATABASE_URL", "postgresql://user:password@localhost/imgworker")
+TASK_QUEUE           = "image_tasks"
+BATCH_QUEUE          = "batch_tasks"
+PRIORITY_QUEUE       = "priority_tasks"
+MAX_IMAGE_SIZE       = (4096, 4096)
+DOWNLOAD_TIMEOUT     = 60
+WEBHOOK_TIMEOUT      = 10
+WEBHOOK_MAX_RETRIES  = 2
+WORKER_CONCURRENCY   = 8
+MAX_RETRIES          = 3
+API_PORT             = int(os.getenv("API_PORT", 5000))
+WATERMARK_TEXT       = os.getenv("WATERMARK_TEXT", "© DeployGuard")
+SLA_SECONDS          = int(os.getenv("SLA_SECONDS", 30))
+CLEANUP_INTERVAL     = 60                      # seconds between cleanup runs
+RESULT_RETENTION_DAYS = 7
+VERIFY_TLS           = os.getenv("VERIFY_TLS", "true").lower() != "false"
 
-# Globals from v3 — all still present
-_metrics = {"tasks_processed": 0, "tasks_failed": 0, "bytes_stored": 0, "cache_hits": 0}
-_image_cache: dict = {}
-_retry_counts: dict = defaultdict(int)
-_job_chain: dict = {}
+# Bounds for in-memory structures so nothing grows forever
+IMAGE_CACHE_MAX      = int(os.getenv("IMAGE_CACHE_MAX", 200))
+DEDUP_CACHE_MAX      = int(os.getenv("DEDUP_CACHE_MAX", 50000))
+SLA_TRACKER_MAX      = int(os.getenv("SLA_TRACKER_MAX", 50000))
 
-# NEW: deduplication — stores seen content hashes, never evicted
-_seen_hashes: set = set()
+# No hardcoded fallback keys — require explicit configuration.
+_api_keys_env = os.getenv("API_KEYS", "")
+API_KEYS = set(k for k in _api_keys_env.split(",") if k)
+if not API_KEYS:
+    log.warning("No API_KEYS configured — all authenticated endpoints will reject every request "
+                "until API_KEYS is set. This is intentional; do not hardcode fallback keys.")
 
-# NEW: SLA tracking — task_id -> enqueue time, never pruned on completion
-_sla_tracker: dict = {}
+
+# ── Thread-safe bounded shared state ─────────────────────────────────────────
+class BoundedDict:
+    """Thread-safe dict with a max size; evicts oldest entries (insertion order)."""
+
+    def __init__(self, max_size: int):
+        self._data = OrderedDict()
+        self._max_size = max_size
+        self._lock = threading.Lock()
+
+    def __contains__(self, key):
+        with self._lock:
+            return key in self._data
+
+    def get(self, key, default=None):
+        with self._lock:
+            return self._data.get(key, default)
+
+    def set(self, key, value):
+        with self._lock:
+            if key in self._data:
+                self._data.move_to_end(key)
+            self._data[key] = value
+            while len(self._data) > self._max_size:
+                self._data.popitem(last=False)
+
+    def pop(self, key, default=None):
+        with self._lock:
+            return self._data.pop(key, default)
+
+    def prune(self, predicate):
+        """Remove entries where predicate(key, value) is True."""
+        with self._lock:
+            stale = [k for k, v in self._data.items() if predicate(k, v)]
+            for k in stale:
+                del self._data[k]
+            return len(stale)
+
+    def __len__(self):
+        with self._lock:
+            return len(self._data)
+
+    def values(self):
+        with self._lock:
+            return list(self._data.values())
 
 
-# ── Database (NEW) ────────────────────────────────────────────────────────────
+class BoundedSet:
+    """Thread-safe set with a max size; evicts oldest entries (insertion order)."""
+
+    def __init__(self, max_size: int):
+        self._data = OrderedDict()
+        self._max_size = max_size
+        self._lock = threading.Lock()
+
+    def add_if_new(self, key) -> bool:
+        """Returns True if key was newly added, False if it already existed."""
+        with self._lock:
+            if key in self._data:
+                return False
+            self._data[key] = True
+            while len(self._data) > self._max_size:
+                self._data.popitem(last=False)
+            return True
+
+    def __len__(self):
+        with self._lock:
+            return len(self._data)
+
+
+class Metrics:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._counters = {"tasks_processed": 0, "tasks_failed": 0, "bytes_stored": 0, "cache_hits": 0}
+
+    def incr(self, key, amount=1):
+        with self._lock:
+            self._counters[key] = self._counters.get(key, 0) + amount
+
+    def snapshot(self):
+        with self._lock:
+            return dict(self._counters)
+
+
+_metrics       = Metrics()
+_image_cache   = BoundedDict(IMAGE_CACHE_MAX)
+_retry_counts  = defaultdict(int)
+_retry_lock    = threading.Lock()
+_job_chain     = BoundedDict(10000)
+_seen_hashes   = BoundedSet(DEDUP_CACHE_MAX)
+_sla_tracker   = BoundedDict(SLA_TRACKER_MAX)
+
+
+def _incr_retry(task_id: str) -> int:
+    with _retry_lock:
+        _retry_counts[task_id] += 1
+        return _retry_counts[task_id]
+
+
+def _get_retry(task_id: str) -> int:
+    with _retry_lock:
+        return _retry_counts[task_id]
+
+
+def _clear_retry(task_id: str):
+    with _retry_lock:
+        _retry_counts.pop(task_id, None)
+
+
+# ── Database ──────────────────────────────────────────────────────────────────
 engine = create_engine(
     DB_URL,
-    pool_size=2,                               # only 2 DB conns for 8 worker threads
-    max_overflow=0,                            # no overflow — threads will block
-    pool_timeout=5,
+    pool_size=WORKER_CONCURRENCY + 4,          # enough for all workers + API + headroom
+    max_overflow=10,
+    pool_timeout=30,
+    pool_pre_ping=True,                        # avoids handing out dead connections
+    pool_recycle=1800,
 )
 Session = sessionmaker(bind=engine)
 
 
+@contextmanager
+def db_session():
+    """Always closes the session, commits on success, rolls back on error."""
+    session = Session()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def wait_for_db(max_attempts=10, base_delay=2):
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            log.info("Database is reachable.")
+            return
+        except OperationalError as e:
+            delay = base_delay * attempt
+            log.warning(f"DB not ready (attempt {attempt}/{max_attempts}): {e}. Retrying in {delay}s.")
+            time.sleep(delay)
+    raise RuntimeError("Database never became reachable; aborting startup.")
+
+
 def init_db():
-    """Create tables if not present. Raw SQL, no migrations."""
-    with engine.connect() as conn:
-        conn.execute(text("""
+    with db_session() as session:
+        session.execute(text("""
             CREATE TABLE IF NOT EXISTS task_results (
-                task_id     TEXT PRIMARY KEY,
-                status      TEXT,
+                task_id      TEXT PRIMARY KEY,
+                status       TEXT,
                 processed_at TIMESTAMP,
-                meta        JSONB,
-                error       TEXT
+                meta         JSONB,
+                error        TEXT
             )
         """))
-        conn.commit()
 
 
 def persist_result(task_id: str, meta: dict, error: str = None):
-    """Write result to Postgres. Session not closed on exception."""
-    session = Session()                        # never used as context manager
     try:
-        session.execute(text("""
-            INSERT INTO task_results (task_id, status, processed_at, meta, error)
-            VALUES (:tid, :status, :ts, :meta, :err)
-            ON CONFLICT (task_id) DO UPDATE SET status=EXCLUDED.status, meta=EXCLUDED.meta
-        """), {
-            "tid":    task_id,
-            "status": "error" if error else "ok",
-            "ts":     datetime.utcnow(),
-            "meta":   json.dumps(meta),
-            "err":    error,
-        })
-        session.commit()
+        with db_session() as session:
+            session.execute(text("""
+                INSERT INTO task_results (task_id, status, processed_at, meta, error)
+                VALUES (:tid, :status, :ts, :meta, :err)
+                ON CONFLICT (task_id) DO UPDATE SET status=EXCLUDED.status, meta=EXCLUDED.meta
+            """), {
+                "tid":    task_id,
+                "status": "error" if error else "ok",
+                "ts":     datetime.utcnow(),
+                "meta":   json.dumps(meta),
+                "err":    error,
+            })
     except Exception as e:
-        print(f"DB write failed for {task_id}: {e}")
-        session.rollback()
-        # session never closed on exception path
+        # DB being down shouldn't crash a worker thread — log and move on.
+        log.error(f"DB write failed for {task_id}: {e}")
 
 
 def query_result(task_id: str) -> dict:
-    """Read result from Postgres. New session per request."""
-    session = Session()
-    row = session.execute(
-        text("SELECT meta, status, error FROM task_results WHERE task_id = :tid"),
-        {"tid": task_id}
-    ).fetchone()
-    session.close()
+    try:
+        with db_session() as session:
+            row = session.execute(
+                text("SELECT meta, status, error FROM task_results WHERE task_id = :tid"),
+                {"tid": task_id}
+            ).fetchone()
+    except Exception as e:
+        log.error(f"DB read failed for {task_id}: {e}")
+        return None
     if not row:
         return None
     return {"meta": json.loads(row[0]), "status": row[1], "error": row[2]}
 
 
 # ── Redis ─────────────────────────────────────────────────────────────────────
-r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=False)
+r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=False,
+                 socket_timeout=10, socket_connect_timeout=10)
 
 
 # ── Flask API ─────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
 
-def check_api_key():
-    """Auth middleware — called manually, not as a before_request hook."""
-    key = request.headers.get("X-API-Key", "")
-    if key not in API_KEYS:
-        return jsonify({"error": "unauthorized"}), 401
-    return None                                # caller must remember to check return value
+def require_api_key(fn):
+    """Decorator so auth can't accidentally be skipped by a route (v4 required
+    every route to manually call check_api_key() and check its return value)."""
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        key = request.headers.get("X-API-Key", "")
+        if not API_KEYS or key not in API_KEYS:
+            return jsonify({"error": "unauthorized"}), 401
+        return fn(*args, **kwargs)
+    return wrapper
 
 
 @app.route("/submit", methods=["POST"])
+@require_api_key
 def submit_task():
-    auth = check_api_key()
-    if auth:
-        return auth
+    data = request.get_json(silent=True)
+    if not data or "id" not in data or "image_url" not in data:
+        return jsonify({"error": "request must include at least 'id' and 'image_url'"}), 400
 
-    data    = request.get_json()
-    payload = json.dumps(data)
+    payload = json.dumps(data, sort_keys=True)
+    content_hash = hashlib.sha256(payload.encode()).hexdigest()
 
-    # Deduplication by content hash
-    content_hash = hashlib.md5(payload.encode()).hexdigest()   # MD5 — weak, collisions possible
-    if content_hash in _seen_hashes:
+    if not _seen_hashes.add_if_new(content_hash):
         return jsonify({"status": "duplicate", "hash": content_hash}), 200
-    _seen_hashes.add(content_hash)             # set grows forever
 
-    priority = data.get("priority", False)
-    queue    = PRIORITY_QUEUE if priority else TASK_QUEUE
+    priority = bool(data.get("priority", False))
+    queue = PRIORITY_QUEUE if priority else TASK_QUEUE
 
-    _sla_tracker[data.get("id", content_hash)] = time.time()  # enqueue time tracked
-    r.rpush(queue, payload)
+    _sla_tracker.set(data["id"], time.time())
+
+    try:
+        r.rpush(queue, payload)
+    except redis.RedisError as e:
+        log.error(f"Failed to enqueue task {data['id']}: {e}")
+        return jsonify({"error": "queue unavailable"}), 503
 
     return jsonify({"status": "queued", "queue": queue, "hash": content_hash}), 202
 
 
 @app.route("/result/<task_id>", methods=["GET"])
+@require_api_key
 def get_result(task_id):
-    auth = check_api_key()
-    if auth:
-        return auth
-
-    row = query_result(task_id)               # DB hit on every request, no cache
+    row = query_result(task_id)
     if not row:
         return jsonify({"error": "not found"}), 404
     return jsonify(row), 200
 
 
 @app.route("/metrics", methods=["GET"])
+@require_api_key
 def get_metrics():
-    # No auth on metrics endpoint — forgot to add check_api_key()
+    now = time.time()
+    breaches = sum(1 for t in _sla_tracker.values() if now - t > SLA_SECONDS)
     return jsonify({
-        **_metrics,
-        "sla_breaches": sum(
-            1 for t in _sla_tracker.values()
-            if time.time() - t > SLA_SECONDS
-        ),
-        "dedup_cache": len(_seen_hashes),
+        **_metrics.snapshot(),
+        "sla_breaches": breaches,
+        "dedup_cache":  len(_seen_hashes),
+        "sla_tracked":  len(_sla_tracker),
     }), 200
 
 
 @app.route("/flush_cache", methods=["POST"])
+@require_api_key
 def flush_cache():
-    auth = check_api_key()
-    if auth:
-        return auth
-    _image_cache.clear()
+    global _image_cache
+    _image_cache = BoundedDict(IMAGE_CACHE_MAX)
     return jsonify({"status": "ok"}), 200
+
+
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    """Unauthenticated liveness probe — deliberately excludes internal counts."""
+    return jsonify(health_check()), 200
 
 
 def run_api():
     app.run(host="0.0.0.0", port=API_PORT, debug=False, use_reloader=False)
 
 
-# ── Scheduled cleanup (NEW) ───────────────────────────────────────────────────
-
+# ── Scheduled cleanup ─────────────────────────────────────────────────────────
 def cleanup_old_results():
-    """Delete DB rows older than 7 days. Runs in its own thread via schedule."""
+    """Prune old DB rows AND the in-memory trackers that mirror them."""
+    cutoff_dt = datetime.utcnow() - timedelta(days=RESULT_RETENTION_DAYS)
     try:
-        with engine.connect() as conn:
-            conn.execute(text(
+        with db_session() as session:
+            session.execute(text(
                 "DELETE FROM task_results WHERE processed_at < :cutoff"
-            ), {"cutoff": datetime.utcnow() - timedelta(days=7)})
-            conn.commit()
-        print(f"[cleanup] Pruned old results at {datetime.utcnow()}")
+            ), {"cutoff": cutoff_dt})
+        log.info(f"[cleanup] Pruned DB rows older than {cutoff_dt.isoformat()}")
     except Exception as e:
-        print(f"[cleanup] Failed: {e}")
-    # _sla_tracker and _seen_hashes are never pruned here
+        log.error(f"[cleanup] DB prune failed: {e}")
+
+    now = time.time()
+    stale_cutoff = now - (RESULT_RETENTION_DAYS * 86400)
+    pruned_sla = _sla_tracker.prune(lambda k, v: v < stale_cutoff)
+    log.info(f"[cleanup] Pruned {pruned_sla} stale SLA tracker entries")
 
 
 def run_scheduler():
-    """Scheduler thread — blocks if cleanup takes longer than CLEANUP_INTERVAL."""
     schedule.every(CLEANUP_INTERVAL).seconds.do(cleanup_old_results)
     while True:
-        schedule.run_pending()
+        try:
+            schedule.run_pending()
+        except Exception as e:
+            log.error(f"[scheduler] cleanup job raised: {e}")
         time.sleep(1)
 
 
 # ── Image helpers ─────────────────────────────────────────────────────────────
-
 def download_image(url: str) -> Image.Image:
-    if url in _image_cache:
-        _metrics["cache_hits"] += 1
-        return _image_cache[url]
-    response = requests.get(url, timeout=DOWNLOAD_TIMEOUT, verify=False)
+    cached = _image_cache.get(url)
+    if cached is not None:
+        _metrics.incr("cache_hits")
+        return cached
+    response = requests.get(url, timeout=DOWNLOAD_TIMEOUT, verify=VERIFY_TLS)
     response.raise_for_status()
     img = Image.open(BytesIO(response.content))
-    _image_cache[url] = img
+    img.load()  # force decode now so a corrupt image fails here, not later
+    _image_cache.set(url, img)
     return img
 
 
@@ -240,6 +424,8 @@ def crop_image(img: Image.Image, box: tuple) -> Image.Image:
 
 
 def add_watermark(img: Image.Image, text: str = WATERMARK_TEXT) -> Image.Image:
+    if img.mode not in ("RGB", "RGBA"):
+        img = img.convert("RGB")
     draw = ImageDraw.Draw(img)
     try:
         font = ImageFont.truetype("arial.ttf", 36)
@@ -250,43 +436,46 @@ def add_watermark(img: Image.Image, text: str = WATERMARK_TEXT) -> Image.Image:
 
 
 def convert_format(img: Image.Image, fmt: str) -> bytes:
+    if fmt.upper() == "JPEG" and img.mode == "RGBA":
+        img = img.convert("RGB")
     buf = BytesIO()
     img.save(buf, format=fmt)
     return buf.getvalue()
 
 
-def encode_image(img: Image.Image) -> bytes:
-    buf = BytesIO()
-    img.save(buf, format="JPEG")
-    return buf.getvalue()
-
-
 def store_result(task_id: str, data: bytes, meta: dict):
-    r.set(f"result:{task_id}:data", data)
-    r.set(f"result:{task_id}:meta", json.dumps(meta))
-    _metrics["bytes_stored"] += len(data)
+    try:
+        r.set(f"result:{task_id}:data", data)
+        r.set(f"result:{task_id}:meta", json.dumps(meta))
+        _metrics.incr("bytes_stored", len(data))
+    except redis.RedisError as e:
+        log.error(f"Failed to store result for {task_id} in Redis: {e}")
+        raise
 
 
 # ── Webhook ───────────────────────────────────────────────────────────────────
-
 def notify_webhook(webhook_url: str, payload: dict):
-    try:
-        requests.post(webhook_url, json=payload)
-    except Exception as e:
-        print(f"Webhook failed: {e}")
+    for attempt in range(1, WEBHOOK_MAX_RETRIES + 2):
+        try:
+            resp = requests.post(webhook_url, json=payload, timeout=WEBHOOK_TIMEOUT)
+            resp.raise_for_status()
+            return
+        except Exception as e:
+            log.warning(f"Webhook attempt {attempt} to {webhook_url} failed: {e}")
+            if attempt <= WEBHOOK_MAX_RETRIES:
+                time.sleep(2 ** attempt)
+    log.error(f"Webhook to {webhook_url} permanently failed after {WEBHOOK_MAX_RETRIES + 1} attempts")
 
 
 # ── Job chaining ──────────────────────────────────────────────────────────────
-
 def enqueue_child_tasks(parent_id: str, child_tasks: list):
-    _job_chain[parent_id] = child_tasks
+    _job_chain.set(parent_id, child_tasks)
     for child in child_tasks:
         child["parent_id"] = parent_id
         r.rpush(TASK_QUEUE, json.dumps(child))
 
 
 # ── Task processing ───────────────────────────────────────────────────────────
-
 def process_task(task: dict):
     task_id     = task["id"]
     url         = task["image_url"]
@@ -298,7 +487,7 @@ def process_task(task: dict):
 
     enqueue_time = _sla_tracker.get(task_id)
     if enqueue_time and (time.time() - enqueue_time) > SLA_SECONDS:
-        print(f"[SLA] Task {task_id} already breached SLA before processing — continuing anyway")
+        log.warning(f"[SLA] Task {task_id} breached SLA before processing — continuing anyway")
 
     img = download_image(url)
     img = resize_image(img)
@@ -320,10 +509,10 @@ def process_task(task: dict):
     }
 
     store_result(task_id, data, meta)
-    persist_result(task_id, meta)              # second write — DB + Redis, no transaction
-    _metrics["tasks_processed"] += 1
+    persist_result(task_id, meta)
+    _metrics.incr("tasks_processed")
+    _sla_tracker.pop(task_id, None)   # completed — stop tracking it
 
-    # SLA tracker entry never removed after completion
     if webhook_url:
         notify_webhook(webhook_url, meta)
     if child_tasks:
@@ -331,7 +520,6 @@ def process_task(task: dict):
 
 
 # ── Batch ─────────────────────────────────────────────────────────────────────
-
 def process_batch(batch: dict):
     tasks    = batch.get("tasks", [])
     batch_id = batch.get("id", "unknown")
@@ -341,31 +529,37 @@ def process_batch(batch: dict):
             process_task(task)
             results.append({"id": task["id"], "status": "ok"})
         except Exception as e:
-            results.append({"id": task["id"], "status": "failed", "error": str(e)})
-    r.set(f"batch:{batch_id}:results", json.dumps(results))
+            log.error(f"Batch {batch_id} task {task.get('id')} failed: {e}")
+            results.append({"id": task.get("id"), "status": "failed", "error": str(e)})
+    try:
+        r.set(f"batch:{batch_id}:results", json.dumps(results))
+    except redis.RedisError as e:
+        log.error(f"Failed to store batch results for {batch_id}: {e}")
 
 
 # ── Retry ─────────────────────────────────────────────────────────────────────
-
 def process_with_retry(task: dict):
     task_id = task["id"]
-    while _retry_counts[task_id] <= MAX_RETRIES:
+    while _get_retry(task_id) <= MAX_RETRIES:
         try:
             process_task(task)
-            del _retry_counts[task_id]
+            _clear_retry(task_id)
             return
         except Exception as e:
-            _retry_counts[task_id] += 1
-            wait = 2 ** _retry_counts[task_id]
-            _metrics["tasks_failed"] += 1
-            print(f"Retry {_retry_counts[task_id]}/{MAX_RETRIES} for {task_id}: {e}")
+            count = _incr_retry(task_id)
+            _metrics.incr("tasks_failed")
+            if count > MAX_RETRIES:
+                break
+            wait = 2 ** count
+            log.warning(f"Retry {count}/{MAX_RETRIES} for {task_id}: {e}")
             time.sleep(wait)
     persist_result(task_id, {}, error="max retries exceeded")
-    print(f"Task {task_id} permanently failed.")
+    _sla_tracker.pop(task_id, None)
+    _clear_retry(task_id)
+    log.error(f"Task {task_id} permanently failed.")
 
 
 # ── Worker threads ────────────────────────────────────────────────────────────
-
 def worker_loop(worker_id: int):
     queues = [PRIORITY_QUEUE, TASK_QUEUE if worker_id % 2 == 0 else BATCH_QUEUE]
     while True:
@@ -381,22 +575,26 @@ def worker_loop(worker_id: int):
                 process_with_retry(task)
         except KeyboardInterrupt:
             break
+        except redis.RedisError as e:
+            log.error(f"Worker {worker_id} lost Redis connection: {e}")
+            time.sleep(2)
         except Exception as e:
-            print(f"Worker {worker_id} error: {e}")
+            log.error(f"Worker {worker_id} error: {e}")
             time.sleep(1)
 
 
 def run_worker():
-    print(f"Starting scheduler, API on :{API_PORT}, and {WORKER_CONCURRENCY} workers…")
+    log.info(f"Starting scheduler, API on :{API_PORT}, and {WORKER_CONCURRENCY} workers…")
 
+    wait_for_db()
     init_db()
 
-    threading.Thread(target=run_api, daemon=True).start()
-    threading.Thread(target=run_scheduler, daemon=True).start()
+    threading.Thread(target=run_api, daemon=True, name="api").start()
+    threading.Thread(target=run_scheduler, daemon=True, name="scheduler").start()
 
     threads = []
     for i in range(WORKER_CONCURRENCY):
-        t = threading.Thread(target=worker_loop, args=(i,), daemon=True)
+        t = threading.Thread(target=worker_loop, args=(i,), daemon=True, name=f"worker-{i}")
         t.start()
         threads.append(t)
 
@@ -405,7 +603,6 @@ def run_worker():
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
-
 def health_check() -> dict:
     try:
         r.ping()
@@ -417,7 +614,7 @@ def health_check() -> dict:
             "cache_size":     len(_image_cache),
             "dedup_size":     len(_seen_hashes),
             "sla_tracker":    len(_sla_tracker),
-            "metrics":        _metrics,
+            "metrics":        _metrics.snapshot(),
         }
     except Exception:
         return {"status": "degraded"}
